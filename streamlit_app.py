@@ -89,6 +89,15 @@ def clamp(x: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, x))
 
 
+# CRISPResso2 note: by default, 15 bp on the 5' end of the reference amplicon are not eligible
+# for quantification/plotting, and likewise the 3' end is effectively trimmed.
+# In your convention/example (100 nt amplicon), valid indices are 15–86 inclusive.
+# Generalized as: valid indices are [15, ref_len-14] inclusive.
+CRISPRESSO_MIN_REF_INDEX = 15
+def crispresso_max_ref_index(ref_len: int) -> int:
+    return max(CRISPRESSO_MIN_REF_INDEX, ref_len - 14)
+
+
 def compute_window_from_nicks(
     peg_hit: GuideHit,
     ng_hit: GuideHit,
@@ -135,8 +144,11 @@ def compute_window_from_nicks(
         end += 1
 
     # clamp to reference bounds
-    start_c = clamp(start, 0, ref_len - 1)
-    end_c   = clamp(end,   0, ref_len - 1)
+    # clamp to CRISPResso-eligible reference bounds (see constants above)
+    lo = CRISPRESSO_MIN_REF_INDEX
+    hi = crispresso_max_ref_index(ref_len)
+    start_c = clamp(start, lo, hi)
+    end_c   = clamp(end,   lo, hi)
     if start_c > end_c:
         start_c, end_c = end_c, start_c
 
@@ -177,10 +189,10 @@ def compute_quant_window_center(
 def compute_plot_window_size(w0: int, w1: int) -> int:
     """
     plot_window_size is a HALF-window around the center:
-      |w1 - w0|/2 + 10
+      |w1 - w0|/2 + 20
     Rounded up to integer.
     """
-    return int(math.ceil(abs(w1 - w0) / 2.0 + 10))
+    return int(math.ceil(abs(w1 - w0) / 2.0 + 20))
 
 
 def qc_plot_window_size(
@@ -193,36 +205,49 @@ def qc_plot_window_size(
     quant_center: int
 ) -> Tuple[int, Optional[str]]:
     """
-    Your QC 4 scenarios reduce to:
-      If ng5 > peg5, the plot window extends to the right from peg 3' end:
-         peg_3p + |center| + plot_window_size/2 must be <= ref_len-1
-      If ng5 < peg5, it extends to the left:
-         peg_3p - |center| - plot_window_size/2 must be >= 0
+    QC plot_window_size against CRISPResso-eligible reference bounds.
 
-    If it fails, shrink plot_window_size to "size of quantification_window_coordinates"
-    which per your plotting convention here is (w1 - w0).
+    plot_window_size here is a HALF-window around the center used by CRISPResso plotting.
+
+    CRISPResso (default) ignores the first 15 bp of the reference and (per your convention/example)
+    also makes the last 14 bp ineligible. Therefore, plotting must stay within:
+        [CRISPRESSO_MIN_REF_INDEX, crispresso_max_ref_index(ref_len)] inclusive.
+
+    If the computed half-window would exceed these bounds, shrink it to the largest value that fits.
     """
-    half = float(plot_window_size)  # already half-window
-    max_idx = ref_len - 1
+    half = int(plot_window_size)  # half-window size (integer)
+    lo = CRISPRESSO_MIN_REF_INDEX
+    hi = crispresso_max_ref_index(ref_len)
+
     peg_3p = peg_hit.ref_3p
     center_abs = abs(int(quant_center))
 
     msg = None
-    new_size = plot_window_size
+    new_half = half
 
+    # When ng5 > peg5, plot window extends to the right from peg 3' end.
     if ng_hit.ref_5p > peg_hit.ref_5p:
-        right_edge = peg_3p + center_abs + half
-        if right_edge > max_idx:
-            new_size = int(math.ceil(abs(w1 - w0) / 2.0))
-            msg = f"QC: plot window would exceed reference right bound (edge≈{right_edge:.1f} > {max_idx}); shrinking --plot_window_size to {new_size}."
+        right_edge = peg_3p + center_abs + new_half
+        if right_edge > hi:
+            allowed = hi - (peg_3p + center_abs)
+            new_half = max(0, int(math.floor(allowed)))
+            msg = (
+                f"QC: plot window would exceed CRISPResso right bound "
+                f"(edge≈{right_edge:.1f} > {hi}); shrinking --plot_window_size to {new_half}."
+            )
+
+    # When ng5 < peg5, plot window extends to the left from peg 3' end.
     elif ng_hit.ref_5p < peg_hit.ref_5p:
-        left_edge = peg_3p - center_abs - half
-        if left_edge < 0:
-            new_size = int(math.ceil(abs(w1 - w0) / 2.0))
-            msg = f"QC: plot window would exceed reference left bound (edge≈{left_edge:.1f} < 0); shrinking --plot_window_size to {new_size}."
+        left_edge = peg_3p - center_abs - new_half
+        if left_edge < lo:
+            allowed = (peg_3p - center_abs) - lo
+            new_half = max(0, int(math.floor(allowed)))
+            msg = (
+                f"QC: plot window would exceed CRISPResso left bound "
+                f"(edge≈{left_edge:.1f} < {lo}); shrinking --plot_window_size to {new_half}."
+            )
 
-    return int(new_size), msg
-
+    return int(new_half), msg
 
 def primer3_like_view_text(
     ref: str,
